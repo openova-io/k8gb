@@ -34,7 +34,7 @@ flowchart TB
         subgraph K8s1["Kubernetes"]
             K8GB1[k8gb CoreDNS<br/>Authoritative]
             EDNS1[ExternalDNS]
-            GW1[Cilium Gateway]
+            GW1[Gateway API]
             SVC1[Services]
             FC1[Failover Controller]
         end
@@ -44,7 +44,7 @@ flowchart TB
         subgraph K8s2["Kubernetes"]
             K8GB2[k8gb CoreDNS<br/>Authoritative]
             EDNS2[ExternalDNS]
-            GW2[Cilium Gateway]
+            GW2[Gateway API]
             SVC2[Services]
             FC2[Failover Controller]
         end
@@ -140,14 +140,81 @@ sequenceDiagram
 
 See [SPEC-SPLIT-BRAIN-PROTECTION](../../handbook/docs/specs/SPEC-SPLIT-BRAIN-PROTECTION.md) for detailed algorithm.
 
-## k8gb vs Failover Controller
+## Component Responsibilities
 
-| Component | Responsibility |
-|-----------|---------------|
-| k8gb | DNS failover for **stateless** services (automatic, fast) |
-| Failover Controller | Data service failover for **stateful** services (witness-verified, safe) |
+### k8gb vs Failover Controller vs ExternalDNS
 
-**Why separate?** Data services (CNPG, MongoDB) require additional verification before promotion to prevent data loss/corruption. k8gb handles DNS; Failover Controller handles data.
+| Component | Responsibility | When Active |
+|-----------|---------------|-------------|
+| **k8gb** | DNS-based traffic routing (automatic failover) | Always |
+| **Failover Controller** | Stateful service promotion (CNPG, MongoDB) | Only when region actually fails |
+| **ExternalDNS** | NS record delegation (one-time setup) | Only for initial delegation |
+
+### Key Clarifications
+
+**Q: Does k8gb make Failover Controller redundant for DNS failover?**
+A: Yes. k8gb handles all DNS failover natively. Failover Controller is ONLY needed for **data service promotion** (e.g., promoting CNPG replica to primary). If you only have stateless services, you don't need Failover Controller at all.
+
+**Q: Do we need ExternalDNS if k8gb manages the GSLB zone?**
+A: ExternalDNS is only needed once to create NS records delegating `gslb.example.com` to k8gb CoreDNS. After that, k8gb is authoritative and manages all GSLB records. ExternalDNS can also manage non-GSLB records (static A records in parent zone).
+
+**Q: Can k8gb manage external SaaS services?**
+A: No. k8gb only manages Kubernetes endpoints. External SaaS services should be accessed directly via their URLs.
+
+### Separation of Concerns
+
+```mermaid
+flowchart TB
+    subgraph DNS["DNS Layer (k8gb)"]
+        K8GB[k8gb handles<br/>all DNS failover]
+        Auto[Automatic based on<br/>health probes]
+    end
+
+    subgraph Data["Data Layer (Failover Controller)"]
+        FC[Failover Controller handles<br/>stateful promotion]
+        Witness[Requires witness quorum<br/>before acting]
+    end
+
+    K8GB --- Auto
+    FC --- Witness
+
+    K8GB -.->|"Independent"| FC
+```
+
+**Why separate?**
+- DNS failover should be instant (30s TTL)
+- Data promotion must be verified (prevent split-brain data corruption)
+- k8gb might flap; Failover Controller requires witness consensus
+
+## Active-Passive with k8gb
+
+k8gb supports active-passive natively via weight annotations:
+
+### Primary Region (weight: 100)
+
+```yaml
+apiVersion: k8gb.absa.oss/v1beta1
+kind: Gslb
+metadata:
+  name: app
+  annotations:
+    k8gb.io/primary-geotag: "region-1"
+    k8gb.io/weight-region-1: "100"
+    k8gb.io/weight-region-2: "0"
+spec:
+  strategy:
+    type: failover  # Active-Passive
+```
+
+### Failover Behavior
+
+| Scenario | Region 1 Weight | Region 2 Weight | Traffic |
+|----------|-----------------|-----------------|---------|
+| Both healthy | 100 | 0 | 100% Region 1 |
+| Region 1 fails | - | 100 (auto) | 100% Region 2 |
+| Region 1 recovers | 100 | 0 | Back to Region 1 |
+
+**Note:** k8gb automatically adjusts weights when health checks fail. No Failover Controller involvement needed for DNS.
 
 ## How k8gb Works
 
@@ -203,6 +270,22 @@ flowchart LR
 | `roundRobin` | Even distribution across healthy endpoints | Active-Active |
 | `failover` | Primary region preferred, DR on failure | Active-Passive |
 | `geoip` | Route by client geography | Latency optimization |
+
+### GeoIP Limitations
+
+**Important:** GeoIP routing has inherent DNS limitations:
+
+- DNS queries come from **resolver IPs**, not client IPs
+- Client at `203.0.113.1` (Asia) queries `8.8.8.8` → k8gb sees Google's IP (US)
+- EDNS Client Subnet (ECS) mitigates this, but not universally supported
+
+| DNS Resolver | ECS Support | Accuracy |
+|--------------|-------------|----------|
+| Google (8.8.8.8) | Yes | Good |
+| Cloudflare (1.1.1.1) | No (privacy) | Poor |
+| ISP resolvers | Varies | Varies |
+
+**Recommendation:** Use `failover` or `roundRobin` for predictable behavior. Use `geoip` only when latency optimization is critical and you accept the limitations.
 
 ## Configuration
 
