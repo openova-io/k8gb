@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2024-10-01
-**Updated:** 2026-01-17
+**Updated:** 2026-01-18
 
 ## Context
 
@@ -11,13 +11,59 @@ Need cross-region DNS-based load balancing that:
 - Supports active-active and active-passive strategies
 - Works without external GSLB services (self-hosted)
 - Acts as authoritative DNS for GSLB zone
-- Prevents split-brain scenarios during failover
+
+## k8gb Limitations (Critical Understanding)
+
+**Deep analysis of k8gb source code (2026-01-18) revealed:**
+
+### How k8gb Actually Works
+
+| Aspect | Mechanism |
+|--------|-----------|
+| Local health | Direct check of Ingress/Gateway endpoints |
+| Cross-cluster "health" | DNS query to `localtargets-*` record |
+| Communication | **DNS only** - no direct health checks |
+
+Each cluster:
+1. Checks its **own** service health locally
+2. **Publishes** `localtargets-*` DNS record if healthy
+3. **Queries** other clusters' `localtargets-*` to discover availability
+
+### The Split-Brain Problem
+
+**k8gb cannot distinguish between:**
+- "Region is down" (failover needed)
+- "Network partition" (failover NOT wanted)
+
+Both produce the same symptom: DNS query fails or times out.
+
+```
+Cluster B queries: localtargets-app.example.com from Cluster A
+├── Gets IPs → "Cluster A has healthy endpoints"
+└── No IPs / timeout → "Cluster A unavailable" (but is it DOWN or PARTITIONED?)
+```
+
+### Implications
+
+| Scenario | k8gb Behavior | Correct? |
+|----------|---------------|----------|
+| Region truly down | Removes from DNS | Yes |
+| Network partition | Also removes from DNS | **No** (unwanted failover) |
+| Both healthy | Returns both | Yes |
+
+### Mitigation: Failover Controller
+
+For **stateless services**: k8gb's behavior is acceptable (brief dual-routing during partition is harmless).
+
+For **stateful services** or strict active-passive: Use **Failover Controller** with cloud witness (Cloudflare KV) to control Gateway/Service readiness. This gates what k8gb sees.
+
+See [ADR-FAILOVER-CONTROLLER](../../failover-controller/docs/ADR-FAILOVER-CONTROLLER.md) for details.
 
 ## Decision
 
 Use **k8gb** (Kubernetes Global Balancer) for cross-region GSLB with:
 - k8gb CoreDNS as **authoritative DNS** for GSLB zone
-- **External DNS witnesses** (8.8.8.8, 1.1.1.1, 9.9.9.9) for split-brain protection
+- **Failover Controller** with Cloudflare witness for split-brain protection
 - Integration with ExternalDNS for parent zone records
 
 ## Architecture
@@ -92,53 +138,55 @@ ns2.gslb.example.com.  A  <k8gb-region2-lb-ip>
 
 ## Split-Brain Protection
 
-### External DNS Witnesses
+### Cloud Witness (Cloudflare Workers + KV)
 
-To prevent split-brain during network partitions, the **Failover Controller** queries external DNS witnesses before triggering data service failovers:
+Since k8gb cannot distinguish "region down" from "network partition", the **Failover Controller** uses a cloud witness to determine who should be active:
 
-| Resolver | Provider | Purpose |
-|----------|----------|---------|
-| 8.8.8.8 | Google | Primary witness |
-| 1.1.1.1 | Cloudflare | Secondary witness |
-| 9.9.9.9 | Quad9 | Tertiary witness |
+| Component | Role |
+|-----------|------|
+| Cloudflare Worker | Lease management API |
+| Cloudflare KV | Lease storage with TTL |
+| Failover Controller | Per-cluster controller that manages readiness |
 
-### Quorum-Based Detection
+### Lease-Based Authority
 
 ```mermaid
 sequenceDiagram
-    participant FC as Failover Controller (R2)
-    participant G as 8.8.8.8
-    participant C as 1.1.1.1
-    participant Q as 9.9.9.9
-    participant K8GB as k8gb CoreDNS (R1)
+    participant FC1 as FC (R1) - Active
+    participant CF as Cloudflare Witness
+    participant FC2 as FC (R2) - Standby
 
-    Note over FC: Detect potential Region 1 failure
+    loop Every 10 seconds
+        FC1->>CF: POST /lease/renew
+        CF-->>FC1: { active: true, holder: "eu1" }
 
-    FC->>G: "Can you reach R1 k8gb?"
-    G->>K8GB: DNS query
-    K8GB--xG: Timeout (Region 1 down)
-    G-->>FC: Cannot resolve
+        FC2->>CF: GET /lease/status
+        CF-->>FC2: { active: false, holder: "eu1" }
+    end
 
-    FC->>C: "Can you reach R1 k8gb?"
-    C-->>FC: Cannot resolve
+    Note over FC1: Region 1 fails, stops renewing
 
-    FC->>Q: "Can you reach R1 k8gb?"
-    Q-->>FC: Cannot resolve
+    Note over CF: Lease expires after 30s TTL
 
-    Note over FC: 3/3 witnesses confirm R1 unreachable
-    Note over FC: SAFE TO PROMOTE - Not split-brain
+    FC2->>CF: GET /lease/status
+    CF-->>FC2: { holder: null }
+
+    FC2->>CF: POST /lease/acquire
+    CF-->>FC2: { active: true, holder: "eu2" }
+
+    Note over FC2: Becomes ACTIVE, enables Gateway
+    Note over FC2: k8gb now sees endpoints in R2
 ```
 
-**Quorum requirement:** 2 out of 3 witnesses must agree the other region is unreachable.
+### How This Prevents Split-Brain
 
-| 8.8.8.8 | 1.1.1.1 | 9.9.9.9 | Decision |
-|---------|---------|---------|----------|
-| ✅ | ✅ | ✅ | Region UP - no action |
-| ✅ | ✅ | ❌ | Region UP - no action |
-| ✅ | ❌ | ❌ | **Region DOWN** - 2/3 agree |
-| ❌ | ❌ | ❌ | **Region DOWN** - 3/3 agree |
+| Scenario | R1 FC | R2 FC | Result |
+|----------|-------|-------|--------|
+| Normal | Holds lease, ACTIVE | Queries lease, STANDBY | Traffic to R1 |
+| R1 down | Stops renewing | Acquires after TTL | Failover to R2 |
+| Network partition | Both reach witness, R1 keeps renewing | Cannot acquire | **No split-brain** |
 
-See [SPEC-SPLIT-BRAIN-PROTECTION](../../handbook/docs/specs/SPEC-SPLIT-BRAIN-PROTECTION.md) for detailed algorithm.
+See [ADR-FAILOVER-CONTROLLER](../../failover-controller/docs/ADR-FAILOVER-CONTROLLER.md) for detailed architecture.
 
 ## Component Responsibilities
 
